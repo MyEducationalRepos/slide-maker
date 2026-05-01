@@ -15,6 +15,8 @@ import os
 import sys
 import requests
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
 
 load_dotenv()
 
@@ -30,6 +32,26 @@ DEFAULTS = {
         "All images must be purely visual with no typography or numerals."
     ),
 }
+
+class TextOptions(BaseModel):
+    audience: Optional[str] = None
+    language: str = "es"
+
+class GammaPayload(BaseModel):
+    inputText: str = Field(..., min_length=5, max_length=100000)
+    textMode: str = "generate"
+    format: str = "presentation"
+    numCards: int = Field(default=20, ge=1, le=100)
+    themeId: Optional[str] = None
+    additionalInstructions: str
+    textOptions: Optional[TextOptions] = None
+
+    @field_validator("inputText")
+    @classmethod
+    def validate_content(cls, v):
+        if not v.strip():
+            raise ValueError("El prompt no puede estar vacío")
+        return v
 
 # ─── Themes disponibles ──────────────────────────────────────────────────────
 
@@ -68,8 +90,16 @@ KNOWN_THEMES = {
 }
 
 def get_api_key() -> str:
-    if not os.path.exists(".env"):
+    env_path = ".env"
+    if not os.path.exists(env_path):
         print("Warning: Archivo .env no encontrado. Asegúrate de tenerlo configurado.", file=sys.stderr)
+    else:
+        # Check permissions on Unix-like systems
+        if sys.platform != "win32":
+            mode = os.stat(env_path).st_mode
+            if mode & 0o077: # If any 'group' or 'others' permissions exist
+                print(f"🔒 Security Tip: Restringe los permisos de {env_path} con 'chmod 600 {env_path}'", file=sys.stderr)
+
     key = os.environ.get("GAMMA_API_KEY", "").strip()
     if not key:
         print("Error: define GAMMA_API_KEY como variable de entorno.", file=sys.stderr)
@@ -93,37 +123,47 @@ def resolve_theme(name: str) -> str:
     return name # Fallback al nombre original
 
 def call_gamma(api_key: str, args: argparse.Namespace) -> dict:
-    """Llama a la API nativa de Gamma."""
+    """Llama a la API nativa de Gamma usando validación Pydantic."""
     
     headers = {
         "X-API-KEY": api_key,
         "Content-Type": "application/json"
     }
     
-    payload = {
-        "inputText": args.prompt,
-        "textMode": "generate",
-        "format": "presentation",
-        "numCards": args.cards,
-        "additionalInstructions": args.additional or DEFAULTS["additional_instructions"]
-    }
-
-    theme_id = resolve_theme(args.theme)
-    if theme_id:
-        payload["themeId"] = theme_id
-
-    # Opciones de texto si se especifican (audiencia, idioma)
-    text_options = {}
-    if args.write_for:
-        text_options["audience"] = args.write_for
-    if args.language:
-        text_options["language"] = args.language
+    # Construcción del payload validado
+    try:
+        payload_data = {
+            "inputText": args.prompt,
+            "additionalInstructions": args.additional or DEFAULTS["additional_instructions"],
+            "numCards": args.cards,
+            "themeId": resolve_theme(args.theme),
+        }
+        
+        if args.write_for or args.language:
+            payload_data["textOptions"] = {
+                "audience": args.write_for,
+                "language": args.language or "es"
+            }
+            
+        payload = GammaPayload(**payload_data)
+    except Exception as e:
+        print(f"❌ Error de validación de datos: {e}", file=sys.stderr)
+        sys.exit(1)
     
-    if text_options:
-        payload["textOptions"] = text_options
+    if args.verbose:
+        print("\n🛠 Debug Payload (Masked):")
+        masked_headers = headers.copy()
+        masked_headers["X-API-KEY"] = "sk-gamma-********"
+        print(f"Headers: {json.dumps(masked_headers, indent=2)}")
+        print(f"Body: {payload.model_dump_json(indent=2)}")
 
     try:
-        response = requests.post(GAMMA_API_URL, headers=headers, json=payload, timeout=120)
+        response = requests.post(
+            GAMMA_API_URL, 
+            headers=headers, 
+            json=payload.model_dump(exclude_none=True), 
+            timeout=120
+        )
         response.raise_for_status()
         return response.json()
     except requests.exceptions.HTTPError:
@@ -161,6 +201,11 @@ def main():
     # Lógica para determinar el contenido del prompt
     if args.file:
         try:
+            # Prevent path traversal by ensuring the file is within the current directory or subdirectories
+            real_path = os.path.realpath(args.file)
+            if not real_path.startswith(os.getcwd()):
+                parser.error("Por seguridad, solo se permiten archivos dentro del directorio del proyecto.")
+
             with open(args.file, "r", encoding="utf-8") as f:
                 args.prompt = f.read()
         except Exception as e:
